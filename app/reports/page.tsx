@@ -34,6 +34,17 @@ type BackendReviewRow = {
   created_at: string;
 };
 
+type MasterProvince = {
+  id: number;
+  name: string;
+};
+
+type MasterCity = {
+  id: number;
+  name: string;
+  province_id: number;
+};
+
 type ReportUser = {
   id: string;
   user_code: string | null;
@@ -143,7 +154,10 @@ export default async function ReportsPage({
     if (result.error) throw new Error(`Gagal memuat laporan: ${result.error.message}`);
   }
 
-  const userMap = new Map<string, ReportUser>((usersResult.data ?? []).map((row) => [row.id, row as ReportUser]));
+  const reportUsers = (usersResult.data ?? []) as ReportUser[];
+  const provinces = (provincesResult.data ?? []) as MasterProvince[];
+  const cities = (citiesResult.data ?? []) as MasterCity[];
+  const userMap = new Map<string, ReportUser>(reportUsers.map((row) => [row.id, row]));
   const qcMap = new Map<string, QcReviewRow>();
   for (const review of (qcReviewsResult.data ?? []) as QcReviewRow[]) {
     if (!qcMap.has(review.survey_id)) qcMap.set(review.survey_id, review);
@@ -154,9 +168,9 @@ export default async function ReportsPage({
     if (!backendMap.has(review.survey_id)) backendMap.set(review.survey_id, review);
   }
 
-  const provinceMap = new Map((provincesResult.data ?? []).map((row) => [row.id, row.name]));
-  const cityMap = new Map((citiesResult.data ?? []).map((row) => [row.id, row.name]));
-  const cityOptions = (citiesResult.data ?? []).filter((row) =>
+  const provinceMap = new Map<number, string>(provinces.map((row) => [row.id, row.name]));
+  const cityMap = new Map<number, string>(cities.map((row) => [row.id, row.name]));
+  const cityOptions = cities.filter((row) =>
     !selectedProvinceId || String(row.province_id) === selectedProvinceId
   );
 
@@ -197,7 +211,7 @@ export default async function ReportsPage({
   const pendingCount = filteredReports.filter((row) => row.reportingStatus === "PENDING").length;
   const passCount = filteredReports.filter((row) => row.reportingStatus === "PASS").length;
   const dropCount = filteredReports.filter((row) => row.reportingStatus === "DROP").length;
-  const supplierUsers = (usersResult.data ?? []).filter((user) => user.role === "supplier") as ReportUser[];
+  const supplierUsers = reportUsers.filter((user) => user.role === "supplier");
 
   const statusTotal = filteredReports.length;
   const statusStats = [

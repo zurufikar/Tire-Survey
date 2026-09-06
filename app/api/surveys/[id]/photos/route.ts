@@ -4,13 +4,44 @@ import { createClient } from "@/lib/supabase/server";
 import { generateTirePositions } from "@/lib/tire-generator/generate-tire-positions";
 
 const BUCKET = "survey-photos";
-const MAX_TIRE_PHOTOS = 10;
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_PHOTOS_PER_SLOT = 10;
+const MAX_UPLOAD_FILES = 10;
+const ALLOWED_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const VEHICLE_CODES = new Set(["FRONT_VIEW", "REAR_VIEW", "SIDE_VIEW"]);
-const AXLE_TYPES = new Set(["STEER", "DRIVE", "FREE_ROLLING"]);
-const TIRE_CONFIGS = new Set(["SINGLE", "DOUBLE"]);
 
-function errorResponse(message: string, status = 400) {
-  return NextResponse.json({ error: message }, { status });
+type AxleConfig = {
+  axle_type: "STEER" | "DRIVE" | "FREE_ROLLING";
+  axle_count: number;
+  tire_configuration: "SINGLE" | "DOUBLE";
+};
+
+type GeneratedTirePosition = {
+  axle_type: "STEER" | "DRIVE" | "FREE_ROLLING";
+  axle_number: number;
+  position_code: string;
+  position_name: string;
+  side: "LEFT" | "RIGHT";
+  tire_layer: "SINGLE" | "INNER" | "OUTER";
+  tire_sequence: number;
+};
+
+function jsonError(message: unknown, status = 400) {
+  const safeMessage = message instanceof Error ? message.message : String(message ?? "Terjadi kesalahan.");
+  return NextResponse.json({ error: safeMessage }, { status });
+}
+
+function getExtension(fileType: string) {
+  switch (fileType) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/png":
+      return "png";
+    case "image/webp":
+      return "webp";
+    default:
+      return null;
+  }
 }
 
 async function getSupplierDraft(surveyId: string) {
@@ -22,447 +53,496 @@ async function getSupplierDraft(surveyId: string) {
     .select("id, supplier_id, status")
     .eq("id", surveyId)
     .eq("supplier_id", profile.id)
-    .in("status", ["DRAFT", "QC_REVISION"])
+    .eq("status", "DRAFT")
     .maybeSingle();
 
   return { profile, supabase, survey, error };
 }
 
-function parseAxleConfigs(raw: unknown) {
-  const value: unknown =
-    Array.isArray(raw)
-      ? raw
-      : typeof raw === "string" && raw.trim()
-        ? JSON.parse(raw)
-        : null;
-  if (!Array.isArray(value)) throw new Error("Konfigurasi poros tidak valid.");
-
-  return value.map((item) => {
-    if (!item || typeof item !== "object") {
-      throw new Error("Konfigurasi poros tidak valid.");
-    }
-
-    const row = item as Record<string, unknown>;
-    const axleType = String(row.axle_type ?? "");
-    const axleCount = Number(row.axle_count);
-    const tireConfiguration = String(row.tire_configuration ?? "");
-
-    if (!AXLE_TYPES.has(axleType)) {
-      throw new Error("Tipe poros tidak valid.");
-    }
-    if (!Number.isInteger(axleCount) || axleCount < 0 || axleCount > 5) {
-      throw new Error("Jumlah poros tidak valid.");
-    }
-    if (!TIRE_CONFIGS.has(tireConfiguration)) {
-      throw new Error("Konfigurasi ban tidak valid.");
-    }
-
-    return {
-      axle_type: axleType as "STEER" | "DRIVE" | "FREE_ROLLING",
-      axle_count: axleCount,
-      tire_configuration: tireConfiguration as "SINGLE" | "DOUBLE",
-    };
-  });
-}
-
-async function ensureTirePosition(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  surveyId: string,
-  positionCode: string,
-  rawAxleConfigs: string,
-) {
-  const { data: existing, error: existingError } = await supabase
-    .from("survey_tires")
-    .select("id, position_code")
-    .eq("survey_id", surveyId)
-    .eq("position_code", positionCode)
-    .maybeSingle();
-
-  if (existingError) {
-    throw new Error(`Gagal mencari posisi ban: ${existingError.message}`);
-  }
-  if (existing) return existing.id;
-  if (!rawAxleConfigs) {
-    throw new Error("Konfigurasi poros belum tersedia.");
-  }
-
-  const axleConfigs = parseAxleConfigs(rawAxleConfigs);
-  const generated = generateTirePositions(axleConfigs);
-  const target = generated.find((position) => position.position_code === positionCode);
-
-  if (!target) {
-    throw new Error("Posisi ban tidak sesuai konfigurasi poros saat ini.");
-  }
-
-  const config = axleConfigs.find((row) => row.axle_type === target.axle_type);
-  if (!config || config.axle_count <= 0) {
-    throw new Error("Konfigurasi poros untuk posisi tersebut tidak valid.");
-  }
-
-  const axleOrder = target.axle_type === "STEER" ? 1 : target.axle_type === "DRIVE" ? 2 : 3;
-  const tireCount =
-    config.axle_count *
-    2 *
-    (config.tire_configuration === "DOUBLE" ? 2 : 1);
-
-  const { data: axle, error: axleError } = await supabase
-    .from("survey_axle_configs")
-    .upsert(
-      {
-        survey_id: surveyId,
-        axle_order: axleOrder,
-        axle_type: config.axle_type,
-        axle_count: config.axle_count,
-        tire_configuration: config.tire_configuration,
-        tire_count: tireCount,
-      },
-      { onConflict: "survey_id,axle_type" },
-    )
-    .select("id")
-    .single();
-
-  if (axleError || !axle) {
-    throw new Error(
-      `Gagal menyiapkan konfigurasi poros: ${axleError?.message ?? "unknown error"}`,
-    );
-  }
-
-  const { data: tire, error: tireError } = await supabase
-    .from("survey_tires")
-    .upsert(
-      {
-        survey_id: surveyId,
-        axle_id: axle.id,
-        axle_type: target.axle_type,
-        axle_number: target.axle_number,
-        position_code: target.position_code,
-        position_name: target.position_name,
-        side: target.side,
-        tire_layer: target.tire_layer,
-        tire_sequence: target.tire_sequence,
-      },
-      { onConflict: "survey_id,position_code" },
-    )
-    .select("id")
-    .single();
-
-  if (tireError || !tire) {
-    throw new Error(
-      `Gagal membuat posisi ban: ${tireError?.message ?? "unknown error"}`,
-    );
-  }
-
-  return tire.id;
-}
-
-async function signedUrl(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  storagePath: string,
-) {
+async function signedUrl(supabase: Awaited<ReturnType<typeof createClient>>, path: string) {
   const { data, error } = await supabase.storage
     .from(BUCKET)
-    .createSignedUrl(storagePath, 60 * 60);
-  return error ? null : data?.signedUrl ?? null;
+    .createSignedUrl(path, 60 * 60);
+
+  if (error) {
+    return null;
+  }
+
+  return data?.signedUrl ?? null;
 }
 
 export async function GET(
   _request: Request,
-  context: { params: Promise<{ id: string }> },
+  context: { params: Promise<{ id: string }> }
 ) {
   const { id } = await context.params;
-  const { supabase, survey, error } = await getSupplierDraft(id);
+  const { supabase, survey, error: surveyError } = await getSupplierDraft(id);
 
-  if (error || !survey) {
-    return errorResponse("Survey tidak ditemukan, bukan milik Supplier ini, atau tidak dapat diedit pada status saat ini.", 404);
+  if (surveyError || !survey) {
+    return jsonError("Draft survey tidak ditemukan atau bukan milik Supplier ini.", 404);
   }
 
-  const [categories, vehicles, tires, positions] = await Promise.all([
+  const [categoriesResult, vehicleResult, tireResult, positionsResult] = await Promise.all([
     supabase
       .from("tire_photo_categories")
       .select("id, code, name, scope, is_required, max_photos, sort_order")
-      .order("sort_order"),
+      .order("sort_order", { ascending: true }),
     supabase
       .from("vehicle_photos")
       .select("id, category_id, storage_path, created_at")
       .eq("survey_id", id)
-      .order("created_at"),
+      .order("created_at", { ascending: true }),
     supabase
       .from("tire_photos")
       .select("id, survey_tire_id, category_id, storage_path, created_at")
-      .not("survey_tire_id", "is", null)
-      .order("created_at"),
+      .order("created_at", { ascending: true }),
     supabase
       .from("survey_tires")
-      .select("id, position_code, position_name, side")
+      .select("id, survey_id, position_code, position_name, side")
       .eq("survey_id", id),
   ]);
 
-  if (categories.error) return errorResponse(`Gagal memuat kategori: ${categories.error.message}`, 500);
-  if (vehicles.error) return errorResponse(`Gagal memuat foto kendaraan: ${vehicles.error.message}`, 500);
-  if (tires.error) return errorResponse(`Gagal memuat foto ban: ${tires.error.message}`, 500);
-  if (positions.error) return errorResponse(`Gagal memuat posisi ban: ${positions.error.message}`, 500);
+  if (categoriesResult.error) {
+    return jsonError(
+      `Gagal memuat master kategori foto: ${categoriesResult.error.message}`,
+      500
+    );
+  }
 
-  const categoryMap = new Map((categories.data ?? []).map((row) => [row.id, row]));
-  const positionMap = new Map((positions.data ?? []).map((row) => [row.id, row]));
+  if (vehicleResult.error) {
+    return jsonError(
+      `Gagal memuat foto kendaraan: ${vehicleResult.error.message}`,
+      500
+    );
+  }
+
+  if (tireResult.error) {
+    return jsonError(
+      `Gagal memuat foto ban: ${tireResult.error.message}`,
+      500
+    );
+  }
+
+  if (positionsResult.error) {
+    return jsonError(
+      `Gagal memuat posisi ban: ${positionsResult.error.message}`,
+      500
+    );
+  }
+
+  const categoryMap = new Map(
+    (categoriesResult.data ?? []).map((category) => [category.id, category])
+  );
+  const positionMap = new Map(
+    (positionsResult.data ?? []).map((position) => [position.id, position])
+  );
 
   const vehiclePhotos = await Promise.all(
-    (vehicles.data ?? []).map(async (photo) => {
+    (vehicleResult.data ?? []).flatMap((photo) => {
       const category = categoryMap.get(photo.category_id);
-      if (!category) return null;
-      return {
-        id: photo.id,
-        categoryId: photo.category_id,
-        categoryCode: category.code,
-        categoryName: category.name,
-        signedUrl: await signedUrl(supabase, photo.storage_path),
-        storagePath: photo.storage_path,
-        createdAt: photo.created_at,
-      };
-    }),
+      if (!category) return [];
+
+      return [
+        signedUrl(supabase, photo.storage_path).then((url) => ({
+          id: photo.id,
+          categoryId: photo.category_id,
+          categoryCode: category.code,
+          categoryName: category.name,
+          signedUrl: url,
+          createdAt: photo.created_at,
+        })),
+      ];
+    })
   );
 
   const tirePhotos = await Promise.all(
-    (tires.data ?? []).map(async (photo) => {
+    (tireResult.data ?? []).flatMap((photo) => {
       const category = categoryMap.get(photo.category_id);
       const position = positionMap.get(photo.survey_tire_id);
-      if (!category || !position) return null;
-      return {
-        id: photo.id,
-        categoryId: photo.category_id,
-        categoryCode: category.code,
-        categoryName: category.name,
-        signedUrl: await signedUrl(supabase, photo.storage_path),
-        storagePath: photo.storage_path,
-        createdAt: photo.created_at,
-        tirePositionId: position.id,
-        positionName: position.position_name,
-        positionCode: position.position_code,
-        side: position.side,
-      };
-    }),
+
+      if (!category || !position) return [];
+
+      return [
+        signedUrl(supabase, photo.storage_path).then((url) => ({
+          id: photo.id,
+          categoryId: photo.category_id,
+          categoryCode: category.code,
+          categoryName: category.name,
+          signedUrl: url,
+          createdAt: photo.created_at,
+          tirePositionId: position.id,
+          positionName: position.position_name,
+          positionCode: position.position_code,
+          side: position.side,
+        })),
+      ];
+    })
   );
 
   return NextResponse.json({
-    categories: categories.data ?? [],
-    vehiclePhotos: vehiclePhotos.filter(Boolean),
-    tirePhotos: tirePhotos.filter(Boolean),
+    categories: categoriesResult.data ?? [],
+    vehiclePhotos,
+    tirePhotos,
   });
 }
 
 export async function POST(
   request: Request,
-  context: { params: Promise<{ id: string }> },
+  context: { params: Promise<{ id: string }> }
 ) {
   const { id } = await context.params;
-  const { profile, supabase, survey, error } = await getSupplierDraft(id);
+  const { supabase, profile, survey, error: surveyError } = await getSupplierDraft(id);
 
-  if (error || !survey) {
-    return errorResponse("Survey tidak ditemukan, bukan milik Supplier ini, atau tidak dapat diedit pada status saat ini.", 404);
+  if (surveyError || !survey) {
+    return jsonError("Draft survey tidak ditemukan atau bukan milik Supplier ini.", 404);
   }
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Payload foto tidak valid.");
+  const formData = await request.formData();
+  const scope = String(formData.get("scope") ?? "");
+  const categoryId = Number(formData.get("category_id"));
+  const positionCode = String(formData.get("position_code") ?? "").trim();
+  const tirePositionId = String(formData.get("tire_position_id") ?? "").trim();
+  const rawAxleConfigs = String(formData.get("axle_configs") ?? "");
+  const files = formData
+    .getAll("files")
+    .filter((value): value is File => value instanceof File && value.size > 0);
+
+  if (scope !== "VEHICLE" && scope !== "TIRE") {
+    return jsonError("Scope foto tidak valid.");
   }
 
-  if (!body || typeof body !== "object") return errorResponse("Payload foto tidak valid.");
+  if (!Number.isSafeInteger(categoryId) || categoryId <= 0) {
+    return jsonError("Kategori foto tidak valid.");
+  }
 
-  const row = body as Record<string, unknown>;
-  const scope = String(row.scope ?? "");
-  const categoryId = Number(row.category_id);
-  const storagePath = String(row.storage_path ?? "").trim();
-  const positionCode = String(row.position_code ?? "").trim();
-  const tirePositionId = String(row.tire_position_id ?? "").trim();
-  const rawAxleConfigs = row.axle_configs;
+  if (files.length === 0) {
+    return jsonError("Pilih minimal satu foto.");
+  }
 
-  if (scope !== "VEHICLE" && scope !== "TIRE") return errorResponse("Scope foto tidak valid.");
-  if (!Number.isSafeInteger(categoryId) || categoryId <= 0) return errorResponse("Kategori foto tidak valid.");
-  if (!storagePath || !storagePath.startsWith(`${id}/`)) return errorResponse("Storage path tidak valid.");
+  if (files.length > MAX_UPLOAD_FILES) {
+    return jsonError(`Maksimal ${MAX_UPLOAD_FILES} foto dalam satu upload.`);
+  }
+
+  for (const file of files) {
+    if (!ALLOWED_TYPES.has(file.type)) {
+      return jsonError("Format foto harus JPG, PNG, atau WebP.");
+    }
+
+    if (file.size > MAX_FILE_SIZE) {
+      return jsonError("Ukuran setiap foto maksimal 10 MB.");
+    }
+  }
 
   const { data: category, error: categoryError } = await supabase
     .from("tire_photo_categories")
-    .select("id, code, name, scope, max_photos")
+    .select("id, code, scope, max_photos")
     .eq("id", categoryId)
     .maybeSingle();
 
-  if (categoryError || !category) return errorResponse("Kategori foto tidak ditemukan.", 404);
-  if (category.scope !== scope) return errorResponse("Kategori foto tidak sesuai scope.");
+  if (categoryError) {
+    return jsonError(
+      `Gagal memuat kategori foto: ${categoryError.message}`,
+      500
+    );
+  }
+
+  if (!category) {
+    return jsonError("Kategori foto tidak ditemukan.", 404);
+  }
+
+  if (category.scope !== scope) {
+    return jsonError("Kategori foto tidak sesuai dengan jenis upload.");
+  }
+
+  if (scope === "VEHICLE" && !VEHICLE_CODES.has(category.code)) {
+    return jsonError("Kategori foto kendaraan tidak valid.");
+  }
+
+  let positionId: string | null = null;
+  let storageFolder: string;
 
   if (scope === "VEHICLE") {
-    if (!VEHICLE_CODES.has(category.code)) return errorResponse("Kategori foto kendaraan tidak valid.");
-
-    const { count, error: countError } = await supabase
+    const { count, error } = await supabase
       .from("vehicle_photos")
       .select("id", { count: "exact", head: true })
       .eq("survey_id", id)
       .eq("category_id", categoryId);
 
-    if (countError) return errorResponse(`Gagal menghitung foto kendaraan: ${countError.message}`, 500);
-    if ((count ?? 0) >= Math.min(category.max_photos ?? MAX_TIRE_PHOTOS, MAX_TIRE_PHOTOS)) {
-      return errorResponse("Maksimal 10 foto untuk kategori ini.");
+    if (error) {
+      return jsonError(`Gagal menghitung foto kendaraan: ${error.message}`, 500);
     }
 
-    const { data, error: insertError } = await supabase
-      .from("vehicle_photos")
-      .insert({
-        survey_id: id,
-        category_id: categoryId,
-        storage_path: storagePath,
-        uploaded_by: profile.id,
-      })
-      .select("id, created_at")
-      .single();
-
-    if (insertError || !data) {
-      return errorResponse(`Metadata foto kendaraan gagal disimpan: ${insertError?.message ?? "unknown error"}`, 500);
+    const maxPhotos = Math.min(category.max_photos ?? MAX_PHOTOS_PER_SLOT, MAX_PHOTOS_PER_SLOT);
+    if ((count ?? 0) + files.length > maxPhotos) {
+      return jsonError(`Maksimal ${maxPhotos} foto untuk slot ini.`);
     }
 
-    return NextResponse.json({
-      photo: {
-        id: data.id,
-        categoryId,
-        categoryCode: category.code,
-        categoryName: category.name,
-        signedUrl: null,
-        storagePath,
-        createdAt: data.created_at,
-      },
-    });
-  }
+    storageFolder = `vehicle/${category.code}`;
+  } else {
+    if (!positionCode) {
+      return jsonError("Position code wajib diisi untuk foto ban.");
+    }
 
-  if (!positionCode) {
-    return errorResponse("Position code wajib diisi untuk foto ban.");
-  }
-
-  let resolvedTirePositionId: string;
-  try {
     if (tirePositionId) {
-      const { data: existingPosition, error: existingPositionError } =
-        await supabase
-          .from("survey_tires")
-          .select("id")
-          .eq("id", tirePositionId)
-          .eq("survey_id", id)
-          .maybeSingle();
+      const { data: tire, error } = await supabase
+        .from("survey_tires")
+        .select("id, position_code")
+        .eq("id", tirePositionId)
+        .eq("survey_id", id)
+        .maybeSingle();
 
-      if (existingPositionError) {
-        throw new Error(
-          `Gagal memeriksa posisi ban: ${existingPositionError.message}`
+      if (error) {
+        return jsonError(`Gagal memeriksa posisi ban: ${error.message}`, 500);
+      }
+
+      if (tire) {
+        if (tire.position_code !== positionCode) {
+          return jsonError("Posisi ban tidak sesuai.");
+        }
+        positionId = tire.id;
+      }
+    }
+
+    if (!positionId) {
+      const { data: tire, error } = await supabase
+        .from("survey_tires")
+        .select("id")
+        .eq("survey_id", id)
+        .eq("position_code", positionCode)
+        .maybeSingle();
+
+      if (error) {
+        return jsonError(`Gagal mencari posisi ban: ${error.message}`, 500);
+      }
+
+      positionId = tire?.id ?? null;
+    }
+
+    if (!positionId) {
+      if (!rawAxleConfigs) {
+        return jsonError(
+          "Posisi ban belum tersimpan. Simpan konfigurasi poros terlebih dahulu."
         );
       }
 
-      if (!existingPosition) {
-        throw new Error("Posisi ban tidak ditemukan pada survey ini.");
+      let axleConfigs: AxleConfig[];
+      try {
+        const parsed: unknown = JSON.parse(rawAxleConfigs);
+        if (!Array.isArray(parsed)) throw new Error("invalid");
+        axleConfigs = parsed as AxleConfig[];
+      } catch {
+        return jsonError("Konfigurasi poros tidak valid.");
       }
 
-      resolvedTirePositionId = existingPosition.id;
-    } else {
-      if (!positionCode) {
-        throw new Error("Position code wajib diisi untuk foto ban.");
+      const generated = generateTirePositions(axleConfigs) as GeneratedTirePosition[];
+      const target = generated.find((item) => item.position_code === positionCode);
+
+      if (!target) {
+        return jsonError("Posisi ban tidak sesuai dengan konfigurasi poros saat ini.");
       }
 
-      resolvedTirePositionId = await ensureTirePosition(
-        supabase,
-        id,
-        positionCode,
-        rawAxleConfigs
-      );
+      const config = axleConfigs.find((item) => item.axle_type === target.axle_type);
+      if (!config || config.axle_count <= 0) {
+        return jsonError("Konfigurasi poros untuk posisi ban tidak valid.");
+      }
+
+      const axleOrder =
+        target.axle_type === "STEER" ? 1 : target.axle_type === "DRIVE" ? 2 : 3;
+      const tireCount =
+        config.axle_count * 2 * (config.tire_configuration === "DOUBLE" ? 2 : 1);
+
+      const { data: axle, error: axleError } = await supabase
+        .from("survey_axle_configs")
+        .upsert(
+          {
+            survey_id: id,
+            axle_order: axleOrder,
+            axle_type: target.axle_type,
+            axle_count: config.axle_count,
+            tire_configuration: config.tire_configuration,
+            tire_count: tireCount,
+          },
+          { onConflict: "survey_id,axle_type" }
+        )
+        .select("id")
+        .single();
+
+      if (axleError || !axle) {
+        return jsonError(
+          `Gagal menyiapkan konfigurasi poros: ${axleError?.message ?? "unknown error"}`,
+          500
+        );
+      }
+
+      const { data: tire, error: tireError } = await supabase
+        .from("survey_tires")
+        .upsert(
+          {
+            survey_id: id,
+            axle_id: axle.id,
+            axle_type: target.axle_type,
+            axle_number: target.axle_number,
+            position_code: target.position_code,
+            position_name: target.position_name,
+            side: target.side,
+            tire_layer: target.tire_layer,
+            tire_sequence: target.tire_sequence,
+          },
+          { onConflict: "survey_id,position_code" }
+        )
+        .select("id")
+        .single();
+
+      if (tireError || !tire) {
+        return jsonError(
+          `Gagal membuat posisi ban: ${tireError?.message ?? "unknown error"}`,
+          500
+        );
+      }
+
+      positionId = tire.id;
     }
-  } catch (positionError) {
-    return errorResponse(
-      positionError instanceof Error ? positionError.message : "Posisi ban gagal disiapkan.",
-      400,
+
+    const { count, error } = await supabase
+      .from("tire_photos")
+      .select("id", { count: "exact", head: true })
+      .eq("survey_tire_id", positionId);
+
+    if (error) {
+      return jsonError(`Gagal menghitung foto ban: ${error.message}`, 500);
+    }
+
+    if ((count ?? 0) + files.length > MAX_PHOTOS_PER_SLOT) {
+      return jsonError(`Maksimal ${MAX_PHOTOS_PER_SLOT} foto untuk satu posisi ban.`);
+    }
+
+    storageFolder = `tire/${positionCode}`;
+  }
+
+  const uploadedPaths: string[] = [];
+  const insertedIds: string[] = [];
+
+  try {
+    for (const file of files) {
+      const extension = getExtension(file.type);
+      if (!extension) throw new Error("Extension file tidak valid.");
+
+      const storagePath = `${id}/${storageFolder}/${crypto.randomUUID()}.${extension}`;
+
+      const { error: storageError } = await supabase.storage
+        .from(BUCKET)
+        .upload(storagePath, file, {
+          contentType: file.type,
+          upsert: false,
+        });
+
+      if (storageError) {
+        throw new Error(`Upload Storage gagal: ${storageError.message}`);
+      }
+
+      uploadedPaths.push(storagePath);
+
+      if (scope === "VEHICLE") {
+        const { data, error } = await supabase
+          .from("vehicle_photos")
+          .insert({
+            survey_id: id,
+            category_id: categoryId,
+            storage_path: storagePath,
+            uploaded_by: profile.id,
+          })
+          .select("id")
+          .single();
+
+        if (error || !data) {
+          throw new Error(
+            `Metadata foto kendaraan gagal disimpan: ${error?.message ?? "unknown error"}`
+          );
+        }
+
+        insertedIds.push(data.id);
+      } else {
+        const { data, error } = await supabase
+          .from("tire_photos")
+          .insert({
+            survey_tire_id: positionId,
+            category_id: categoryId,
+            storage_path: storagePath,
+            uploaded_by: profile.id,
+          })
+          .select("id")
+          .single();
+
+        if (error || !data) {
+          throw new Error(
+            `Metadata foto ban gagal disimpan: ${error?.message ?? "unknown error"}`
+          );
+        }
+
+        insertedIds.push(data.id);
+      }
+    }
+  } catch (error) {
+    if (scope === "VEHICLE" && insertedIds.length) {
+      await supabase.from("vehicle_photos").delete().in("id", insertedIds);
+    }
+
+    if (scope === "TIRE" && insertedIds.length) {
+      await supabase.from("tire_photos").delete().in("id", insertedIds);
+    }
+
+    if (uploadedPaths.length) {
+      await supabase.storage.from(BUCKET).remove(uploadedPaths);
+    }
+
+    return jsonError(
+      error instanceof Error ? error.message : "Foto gagal diupload.",
+      500
     );
   }
 
-  const { count, error: countError } = await supabase
-    .from("tire_photos")
-    .select("id", { count: "exact", head: true })
-    .eq("survey_tire_id", resolvedTirePositionId);
-
-  if (countError) return errorResponse(`Gagal menghitung foto ban: ${countError.message}`, 500);
-  if ((count ?? 0) >= MAX_TIRE_PHOTOS) return errorResponse("Maksimal 10 foto untuk posisi ban ini.");
-
-  const { data: position, error: positionError } = await supabase
-    .from("survey_tires")
-    .select("id, position_name, position_code, side")
-    .eq("id", resolvedTirePositionId)
-    .single();
-
-  if (positionError || !position) {
-    return errorResponse(`Posisi ban tidak ditemukan: ${positionError?.message ?? "unknown error"}`, 500);
-  }
-
-  const { data, error: insertError } = await supabase
-    .from("tire_photos")
-    .insert({
-      survey_tire_id: resolvedTirePositionId,
-      category_id: categoryId,
-      storage_path: storagePath,
-      uploaded_by: profile.id,
-    })
-    .select("id, created_at")
-    .single();
-
-  if (insertError || !data) {
-    return errorResponse(`Metadata foto ban gagal disimpan: ${insertError?.message ?? "unknown error"}`, 500);
-  }
-
   return NextResponse.json({
-    photo: {
-      id: data.id,
-      categoryId,
-      categoryCode: category.code,
-      categoryName: category.name,
-      signedUrl: null,
-      storagePath,
-      createdAt: data.created_at,
-      tirePositionId: position.id,
-      positionName: position.position_name,
-      positionCode: position.position_code,
-      side: position.side,
-    },
+    success: true,
+    uploaded: insertedIds.length,
   });
 }
 
 export async function DELETE(
   request: Request,
-  context: { params: Promise<{ id: string }> },
+  context: { params: Promise<{ id: string }> }
 ) {
   const { id } = await context.params;
-  const { supabase, survey, error } = await getSupplierDraft(id);
+  const { supabase, survey, error: surveyError } = await getSupplierDraft(id);
 
-  if (error || !survey) {
-    return errorResponse("Survey tidak ditemukan, bukan milik Supplier ini, atau tidak dapat diedit pada status saat ini.", 404);
+  if (surveyError || !survey) {
+    return jsonError("Draft survey tidak ditemukan atau bukan milik Supplier ini.", 404);
   }
 
-  let body: unknown;
+  let body: { photo_id?: string };
   try {
-    body = await request.json();
+    body = (await request.json()) as { photo_id?: string };
   } catch {
-    return errorResponse("Payload delete tidak valid.");
+    return jsonError("Payload delete foto tidak valid.");
   }
 
-  const photoId =
-    body && typeof body === "object"
-      ? String((body as Record<string, unknown>).photo_id ?? "").trim()
-      : "";
+  const photoId = String(body.photo_id ?? "").trim();
+  if (!photoId) {
+    return jsonError("ID foto wajib diisi.");
+  }
 
-  if (!photoId) return errorResponse("ID foto wajib diisi.");
-
-  const vehicle = await supabase
+  const { data: vehiclePhoto, error: vehicleLookupError } = await supabase
     .from("vehicle_photos")
     .select("id, storage_path")
     .eq("id", photoId)
     .eq("survey_id", id)
     .maybeSingle();
 
-  if (vehicle.error) return errorResponse(`Gagal mencari foto kendaraan: ${vehicle.error.message}`, 500);
+  if (vehicleLookupError) {
+    return jsonError(`Gagal mencari foto kendaraan: ${vehicleLookupError.message}`, 500);
+  }
 
-  if (vehicle.data) {
-    const { data: deleted, error: deleteError } = await supabase
+  if (vehiclePhoto) {
+    const { data: deleted, error } = await supabase
       .from("vehicle_photos")
       .delete()
       .eq("id", photoId)
@@ -470,40 +550,88 @@ export async function DELETE(
       .select("id")
       .maybeSingle();
 
-    if (deleteError) return errorResponse(`Foto gagal dihapus: ${deleteError.message}`, 500);
-    if (!deleted) return errorResponse("Foto kendaraan tidak berhasil dihapus.", 409);
+    if (error) {
+      return jsonError(`Foto kendaraan gagal dihapus: ${error.message}`, 500);
+    }
 
-    return NextResponse.json({ success: true, storagePath: vehicle.data.storage_path });
+    if (!deleted) {
+      return jsonError(
+        "Foto ditemukan tetapi tidak dapat dihapus. Periksa policy RLS vehicle_photos.",
+        403
+      );
+    }
+
+    const { error: storageError } = await supabase.storage
+      .from(BUCKET)
+      .remove([vehiclePhoto.storage_path]);
+
+    if (storageError) {
+      return jsonError(
+        `Metadata foto sudah terhapus, tetapi file Storage gagal dihapus: ${storageError.message}`,
+        500
+      );
+    }
+
+    return NextResponse.json({ success: true });
   }
 
-  const tire = await supabase
+  const { data: tirePhoto, error: tireLookupError } = await supabase
     .from("tire_photos")
     .select("id, storage_path, survey_tire_id")
     .eq("id", photoId)
     .maybeSingle();
 
-  if (tire.error) return errorResponse(`Gagal mencari foto ban: ${tire.error.message}`, 500);
-  if (!tire.data) return errorResponse("Foto tidak ditemukan.", 404);
+  if (tireLookupError) {
+    return jsonError(`Gagal mencari foto ban: ${tireLookupError.message}`, 500);
+  }
 
-  const owner = await supabase
+  if (!tirePhoto) {
+    return jsonError("Foto tidak ditemukan.", 404);
+  }
+
+  const { data: tireOwner, error: tireOwnerError } = await supabase
     .from("survey_tires")
     .select("id")
-    .eq("id", tire.data.survey_tire_id)
+    .eq("id", tirePhoto.survey_tire_id)
     .eq("survey_id", id)
     .maybeSingle();
 
-  if (owner.error) return errorResponse(`Gagal memeriksa foto ban: ${owner.error.message}`, 500);
-  if (!owner.data) return errorResponse("Foto bukan milik Draft ini.", 404);
+  if (tireOwnerError) {
+    return jsonError(`Gagal memeriksa pemilik posisi ban: ${tireOwnerError.message}`, 500);
+  }
 
-  const { data: deleted, error: deleteError } = await supabase
+  if (!tireOwner) {
+    return jsonError("Foto ban bukan bagian dari Draft ini.", 403);
+  }
+
+  const { data: deletedTire, error: tireDeleteError } = await supabase
     .from("tire_photos")
     .delete()
     .eq("id", photoId)
     .select("id")
     .maybeSingle();
 
-  if (deleteError) return errorResponse(`Foto gagal dihapus: ${deleteError.message}`, 500);
-  if (!deleted) return errorResponse("Foto ban tidak berhasil dihapus.", 409);
+  if (tireDeleteError) {
+    return jsonError(`Foto ban gagal dihapus: ${tireDeleteError.message}`, 500);
+  }
 
-  return NextResponse.json({ success: true, storagePath: tire.data.storage_path });
+  if (!deletedTire) {
+    return jsonError(
+      "Foto ditemukan tetapi tidak dapat dihapus. Periksa policy RLS tire_photos.",
+      403
+    );
+  }
+
+  const { error: storageError } = await supabase.storage
+    .from(BUCKET)
+    .remove([tirePhoto.storage_path]);
+
+  if (storageError) {
+    return jsonError(
+      `Metadata foto sudah terhapus, tetapi file Storage gagal dihapus: ${storageError.message}`,
+      500
+    );
+  }
+
+  return NextResponse.json({ success: true });
 }
