@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { createAdminClient } from "@/lib/supabase/admin";
 
 function normalizeUserCode(value: unknown) {
   return typeof value === "string" ? value.trim().toUpperCase() : "";
@@ -15,26 +14,34 @@ export async function POST(request: Request) {
 
     if (!userCode || !password) return invalid();
 
-    const admin = createAdminClient();
-    const { data: profile, error: profileError } = await admin
-      .from("users")
-      .select("id, role, is_active")
-      .eq("user_code", userCode)
-      .maybeSingle();
-
-    if (profileError || !profile || !profile.is_active) return invalid();
-
-    const { data: authUser, error: authLookupError } = await admin.auth.admin.getUserById(profile.id);
-    if (authLookupError || !authUser.user?.email) return invalid();
-
     const supabase = await createClient();
+
+    // Resolves user_code -> email via the `get_login_email` RPC (see
+    // migration 020). That function is SECURITY DEFINER, so this lookup
+    // works with only the publishable key — no service role key needed
+    // at runtime, in dev or in production.
+    const { data: rows, error: lookupError } = await supabase.rpc("get_login_email", {
+      p_user_code: userCode,
+    });
+    const match = rows?.[0];
+
+    if (lookupError || !match || !match.is_active || !match.email) return invalid();
+
     const { error: signInError } = await supabase.auth.signInWithPassword({
-      email: authUser.user.email,
+      email: match.email,
       password,
     });
     if (signInError) return invalid();
 
-    return NextResponse.json({ ok: true, role: profile.role });
+    // Now that the request is authenticated, RLS lets us read the caller's
+    // own profile directly (see users_select_own_or_superadmin policy).
+    const { data: profile } = await supabase
+      .from("users")
+      .select("role")
+      .eq("user_code", userCode)
+      .maybeSingle();
+
+    return NextResponse.json({ ok: true, role: profile?.role ?? null });
   } catch (error) {
     console.error("POST /api/auth/login failed", error);
     return NextResponse.json({ error: "Terjadi kesalahan saat login." }, { status: 500 });
