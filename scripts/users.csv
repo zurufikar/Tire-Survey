@@ -1,0 +1,5 @@
+user_code,full_name,role,password,is_active,email
+DS001,Agen Supplier 001,supplier,ChangeMe001!,true,
+DS002,Agen Supplier 002,supplier,ChangeMe002!,true,
+QC001,QC Backend 001,qc_backend,ChangeMe003!,true,
+QC002,QC Backend 002,qc_backend,ChangeMe004!,true,
