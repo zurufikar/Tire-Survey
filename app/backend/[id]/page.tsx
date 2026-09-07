@@ -23,7 +23,7 @@ export default async function BackendReviewPage({ params }: Props) {
     supabase.from("master_tire_patterns").select("id,pattern,application,tire_brand_id,vehicle_category").eq("is_active", true).order("pattern"),
   ]);
   if (surveyResult.error || !surveyResult.data || tireResult.error || provincesResult.error || citiesResult.error || vehicleBrandsResult.error || tireBrandsResult.error || tireSizesResult.error || tirePatternsResult.error) notFound();
-  if (!["QC_PASSED", "BACKEND_REVIEW"].includes(surveyResult.data.status)) notFound();
+  if (!["QC_PASSED", "BACKEND_REVIEW", "BACKEND_REVISION"].includes(surveyResult.data.status)) notFound();
 
   const tireIds = (tireResult.data ?? []).map((t) => t.id);
   const photosResult = tireIds.length

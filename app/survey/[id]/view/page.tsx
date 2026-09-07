@@ -1,8 +1,10 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { requireRole } from "@/lib/auth";
+import { requireRole, type AppRole } from "@/lib/auth";
 import { createClient } from "@/lib/supabase/server";
 import { SupplierSurveyReview } from "@/components/survey/supplier-survey-review";
+import { SurveyStatusCorrection } from "@/components/admin/survey-status-correction";
+import { ROLE_HOME } from "@/lib/role-home";
 
 type ViewSurveyPageProps = { params: Promise<{ id: string }> };
 
@@ -45,12 +47,32 @@ async function createSignedUrlMap(
 }
 
 export default async function SupplierSurveyViewPage({ params }: ViewSurveyPageProps) {
-  const { profile } = await requireRole(["supplier"]);
+  // Read-only for everyone: the supplier who owns it, plus QC/Backend/PM/PIC
+  // and Superadmin, who all need to open this page from their own queues
+  // and reports (the QC/PM/Backend "history" links point here).
+  const { profile } = await requireRole([
+    "supplier",
+    "qc_backend",
+    "pm_pic",
+    "superadmin",
+  ]);
+  const isSupplier = profile.role === "supplier";
   const { id } = await params;
   const supabase = await createClient();
 
+  let surveyQuery = supabase
+    .from("surveys")
+    .select("id, serial_number, survey_date, plate_number, province_id, city_id, city_other, vehicle_category, segment, bus_category, truck_category, specific_vehicle_type, company_name, vehicle_brand_id, vehicle_brand_other, cargo_type, total_axles, total_tires, status, submitted_at, completed_at, updated_at")
+    .eq("id", id);
+  // A supplier only ever sees their own survey; other roles rely on the
+  // surveys_supplier_select RLS policy, which already opens every survey to
+  // active qc_backend/pm_pic/superadmin accounts.
+  if (isSupplier) {
+    surveyQuery = surveyQuery.eq("supplier_id", profile.id);
+  }
+
   const [surveyResult, provinceResult, cityResult, brandResult, categoriesResult, vehiclePhotosResult, tiresResult, tirePhotosResult, reviewsResult] = await Promise.all([
-    supabase.from("surveys").select("id, serial_number, survey_date, plate_number, province_id, city_id, city_other, vehicle_category, segment, bus_category, truck_category, specific_vehicle_type, company_name, vehicle_brand_id, vehicle_brand_other, cargo_type, total_axles, total_tires, status, submitted_at, completed_at, updated_at").eq("id", id).eq("supplier_id", profile.id).single(),
+    surveyQuery.single(),
     supabase.from("master_provinces").select("id, name").eq("is_active", true),
     supabase.from("master_cities").select("id, name").eq("is_active", true),
     supabase.from("master_vehicle_brands").select("id, name").eq("is_active", true),
@@ -122,12 +144,17 @@ export default async function SupplierSurveyViewPage({ params }: ViewSurveyPageP
               <p className="mt-1 text-sm text-slate-500">Status: {STATUS_LABEL[survey.status] ?? survey.status}</p>
             </div>
             <div className="flex flex-col gap-2 sm:flex-row">
-              {survey.status === "QC_REVISION" && (
+              {isSupplier && survey.status === "QC_REVISION" && (
                 <Link href={`/survey/${survey.id}/edit`} className="inline-flex rounded-lg bg-orange-600 px-3 py-2 text-sm font-semibold text-white hover:bg-orange-700">
                   Perbaiki Survey
                 </Link>
               )}
-              <Link href="/dashboard" className="inline-flex rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">Kembali ke Dashboard</Link>
+              <Link
+                href={ROLE_HOME[profile.role as AppRole] ?? "/dashboard"}
+                className="inline-flex rounded-lg border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Kembali
+              </Link>
             </div>
           </div>
         </header>
@@ -165,6 +192,10 @@ export default async function SupplierSurveyViewPage({ params }: ViewSurveyPageP
             reviewedAt: review.reviewed_at,
           }))}
         />
+
+        {profile.role === "superadmin" && (
+          <SurveyStatusCorrection surveyId={survey.id} currentStatus={survey.status} />
+        )}
       </div>
     </main>
   );

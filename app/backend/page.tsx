@@ -175,8 +175,12 @@ export default async function BackendQueuePage() {
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {completedItems.map(({ assignment, survey }) => (
-                      <tr key={assignment.id}>
-                        <td className="px-4 py-3 font-medium text-slate-900">{survey.serial_number ?? "-"}</td>
+                      <tr key={assignment.id} className="hover:bg-slate-50">
+                        <td className="px-4 py-3 font-medium text-slate-900">
+                          <a href={`/survey/${survey.id}/view`} className="text-blue-600 hover:underline">
+                            {survey.serial_number ?? "-"}
+                          </a>
+                        </td>
                         <td className="px-4 py-3 text-slate-700">{survey.plate_number || "-"}</td>
                         <td className="px-4 py-3 text-slate-700">{survey.company_name || "-"}</td>
                         <td className="px-4 py-3"><span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusClass(survey.status)}`}>{statusLabel(survey.status)}</span></td>
